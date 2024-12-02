@@ -165,10 +165,24 @@ resource "helm_release" "istio_ingress" {
 
   depends_on = [helm_release.istiod]
 }
-
+output "bookinfo_raw_content" {
+  value = file("${path.module}/bookinfo.yaml")
+  sensitive = true
+}
+output "bookinfo_split_debug" {
+  value = [
+    for idx, doc in toset(split("---\n", file("${path.module}/bookinfo.yaml"))) : 
+    "${idx}: ${substr(doc, 0, 50)}..."  # Show first 50 chars of each document
+  ]
+}
 # Deploy Bookinfo application
 resource "kubectl_manifest" "bookinfo_manifests" {
-  yaml_body = file("${path.module}/bookinfo.yaml")
+  for_each = {
+    for idx, doc in compact(split("---", file("${path.module}/bookinfo.yaml"))) : 
+    idx => doc if trimspace(doc) != ""
+  }
+  yaml_body = each.value
+
   depends_on = [
     kubectl_manifest.namespace_bookinfo,
     helm_release.istiod
@@ -233,4 +247,89 @@ resource "kubectl_manifest" "bookinfo_virtualservice" {
   EOF
 
   depends_on = [kubectl_manifest.bookinfo_gateway]
+}
+
+# Add Keycloak namespace
+resource "kubectl_manifest" "namespace_keycloak" {
+  yaml_body = <<-EOF
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: keycloak
+  EOF
+  depends_on = [kind_cluster.istio_cluster]
+}
+
+# Add Keycloak Helm repository
+resource "helm_release" "keycloak" {
+  name       = "keycloak"
+  repository = "https://charts.bitnami.com/bitnami"
+  chart      = "keycloak"
+  namespace  = "keycloak"
+  version          = "17.3.6"  # Updated to a known stable version
+  create_namespace = true
+  timeout          = 900  # Increased timeout to 15 minutes
+  wait             = true
+
+  set {
+    name  = "auth.adminUser"
+    value = "admin"
+  }
+
+  set {
+    name  = "auth.adminPassword"
+    value = "admin123"
+  }
+
+  set {
+    name  = "service.type"
+    value = "NodePort"
+  }
+
+  set {
+    name  = "service.nodePorts.http"
+    value = "30002"
+  }
+
+  depends_on = [kubectl_manifest.namespace_keycloak]
+}
+
+# Configure RequestAuthentication for Istio
+resource "kubectl_manifest" "request_authentication" {
+  yaml_body = <<-EOF
+    apiVersion: security.istio.io/v1beta1
+    kind: RequestAuthentication
+    metadata:
+      name: jwt-auth
+      namespace: bookinfo
+    spec:
+      selector:
+        matchLabels:
+          app: productpage
+      jwtRules:
+      - issuer: "http://localhost:30002/realms/bookinfo"
+        jwksUri: "http://keycloak.keycloak.svc.cluster.local:80/realms/bookinfo/protocol/openid-connect/certs"
+        forwardOriginalToken: true
+  EOF
+  depends_on = [helm_release.keycloak, kubectl_manifest.bookinfo_manifests]
+}
+
+
+# Configure AuthorizationPolicy
+resource "kubectl_manifest" "authorization_policy" {
+  yaml_body = <<-EOF
+    apiVersion: security.istio.io/v1beta1
+    kind: AuthorizationPolicy
+    metadata:
+      name: require-jwt
+      namespace: bookinfo
+    spec:
+      selector:
+        matchLabels:
+          app: productpage
+      action: ALLOW
+      rules:
+      - {}  # Empty rule to allow all traffic during testing
+  EOF
+  depends_on = [kubectl_manifest.request_authentication]
 }
