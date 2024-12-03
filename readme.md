@@ -1,0 +1,1 @@
+kubectl create secret generic oauth-token --from-literal=client-secret=PBXkvJ8msmI0DhGrDIkoxHXtPBZKdg6x -n istio-system

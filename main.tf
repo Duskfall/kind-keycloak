@@ -44,6 +44,11 @@ resource "kind_cluster" "istio_cluster" {
         host_port      = 30001
         protocol       = "TCP"
       }
+      extra_port_mappings {
+        container_port = 30002
+        host_port      = 30002
+        protocol       = "TCP"
+      }
     }
 
     node {
@@ -230,6 +235,8 @@ resource "kubectl_manifest" "bookinfo_virtualservice" {
       http:
       - match:
         - uri:
+            exact: /
+        - uri:
             exact: /productpage
         - uri:
             prefix: /static
@@ -239,6 +246,8 @@ resource "kubectl_manifest" "bookinfo_virtualservice" {
             exact: /logout
         - uri:
             prefix: /api/v1/products
+        - uri:
+            regex: ".*\\.(css|js|png|jpg|gif)$"
         route:
         - destination:
             host: productpage
@@ -246,7 +255,9 @@ resource "kubectl_manifest" "bookinfo_virtualservice" {
               number: 9080
   EOF
 
-  depends_on = [kubectl_manifest.bookinfo_gateway]
+  depends_on = [
+    kubectl_manifest.bookinfo_gateway
+  ]
 }
 
 # Add Keycloak namespace
@@ -307,15 +318,59 @@ resource "kubectl_manifest" "request_authentication" {
         matchLabels:
           app: productpage
       jwtRules:
-      - issuer: "http://localhost:30002/realms/bookinfo"
-        jwksUri: "http://keycloak.keycloak.svc.cluster.local:80/realms/bookinfo/protocol/openid-connect/certs"
+      - issuer: "http://localhost:30002/realms/master"
+        jwksUri: "http://keycloak.keycloak:80/realms/master/protocol/openid-connect/certs"
         forwardOriginalToken: true
+        outputPayloadToHeader: "x-auth-payload"
+        fromHeaders:
+        - name: Authorization
+          prefix: "Bearer "
   EOF
   depends_on = [helm_release.keycloak, kubectl_manifest.bookinfo_manifests]
 }
 
 
 # Configure AuthorizationPolicy
+# resource "kubectl_manifest" "authorization_policy" {
+#   yaml_body = <<-EOF
+#     apiVersion: security.istio.io/v1beta1
+#     kind: AuthorizationPolicy
+#     metadata:
+#       name: require-jwt
+#       namespace: bookinfo
+#     spec:
+#       selector:
+#         matchLabels:
+#           app: productpage
+#       action: ALLOW
+#       rules:
+#       - from:
+#         - source:
+#             requestPrincipals: ["*"]
+#         to:
+#         - operation:
+#             paths: ["/productpage", "/static/*", "/api/v1/products/*"]
+#       # Allow static resources without authentication
+#       - to:
+#         - operation:
+#             paths: 
+#             - "/*.css"
+#             - "/*.js"
+#             - "/*.png"
+#             - "/*.jpg"
+#             - "/*.gif"
+#             - "/static/*"
+#       # Allow authentication flow
+#       - to:
+#         - operation:
+#             paths: ["/productpage"]
+#             queryParams:
+#               state: ["*"]
+#               session_state: ["*"]
+#               code: ["*"]
+#   EOF
+#   depends_on = [kubectl_manifest.request_authentication]
+# }
 resource "kubectl_manifest" "authorization_policy" {
   yaml_body = <<-EOF
     apiVersion: security.istio.io/v1beta1
@@ -329,7 +384,207 @@ resource "kubectl_manifest" "authorization_policy" {
           app: productpage
       action: ALLOW
       rules:
-      - {}  # Empty rule to allow all traffic during testing
+      # Allow only authenticated users for productpage
+      - from:
+        - source:
+            requestPrincipals: ["*"]
+        to:
+        - operation:
+            paths: 
+            - "/productpage"
+            - "/api/v1/products/*"
+      # Allow static resources without authentication
+      - to:
+        - operation:
+            paths: 
+            - "/*.css"
+            - "/*.js"
+            - "/*.png"
+            - "/*.jpg"
+            - "/*.gif"
+            - "/static/*"
+      # Allow authentication flow
+      - to:
+        - operation:
+            paths: ["/productpage"]
+            queryParams:
+              state: ["*"]
+              session_state: ["*"]
+              code: ["*"]
   EOF
-  depends_on = [kubectl_manifest.request_authentication]
+  depends_on = [kubectl_manifest.namespace_bookinfo]
+}
+
+resource "kubectl_manifest" "keycloak_gateway" {
+  yaml_body = <<-EOF
+    apiVersion: networking.istio.io/v1alpha3
+    kind: Gateway
+    metadata:
+      name: keycloak-gateway
+      namespace: keycloak
+    spec:
+      selector:
+        istio: ingressgateway
+      servers:
+      - port:
+          number: 80
+          name: http
+          protocol: HTTP
+        hosts:
+        - "*"
+  EOF
+
+  depends_on = [
+    helm_release.keycloak,
+    helm_release.istio_ingress
+  ]
+}
+
+resource "kubectl_manifest" "keycloak_virtualservice" {
+  yaml_body = <<-EOF
+    apiVersion: networking.istio.io/v1alpha3
+    kind: VirtualService
+    metadata:
+      name: keycloak
+      namespace: keycloak
+    spec:
+      hosts:
+      - "*"
+      gateways:
+      - keycloak-gateway
+      http:
+      - match:
+        - uri:
+            prefix: /
+        route:
+        - destination:
+            host: keycloak
+            port:
+              number: 8080
+  EOF
+
+  depends_on = [
+    kubectl_manifest.keycloak_gateway
+  ]
+}
+
+# resource "kubectl_manifest" "bookinfo_envoyfilter" {
+#   yaml_body = <<-EOF
+#     apiVersion: networking.istio.io/v1alpha3
+#     kind: EnvoyFilter
+#     metadata:
+#       name: authn-filter
+#       namespace: istio-system
+#     spec:
+#       workloadSelector:
+#         labels:
+#           istio: ingressgateway
+#       configPatches:
+#       - applyTo: HTTP_FILTER
+#         match:
+#           context: GATEWAY
+#           listener:
+#             filterChain:
+#               filter:
+#                 name: envoy.filters.network.http_connection_manager
+#                 subFilter:
+#                   name: envoy.filters.http.router
+#         patch:
+#           operation: INSERT_BEFORE
+#           value:
+#             name: envoy.filters.http.oauth2
+#             typed_config:
+#               "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2
+#               token_endpoint: "http://keycloak.keycloak.svc.cluster.local:8080/realms/master/protocol/openid-connect/token"
+#               authorization_endpoint: "http://localhost:30002/realms/master/protocol/openid-connect/auth"
+#               redirect_uri: "http://localhost:30000/productpage"
+#               redirect_path_matcher:
+#                 exact: "/productpage"
+#               signout_path:
+#                 exact: "/signout"
+#               credentials:
+#                 client_id: "bookinfo"
+#                 token_secret:
+#                   name: oauth-token
+#                   generic_secret:
+#                     secret: "PBXkvJ8msmI0DhGrDIkoxHXtPBZKdg6x"
+#                 hmac_secret:
+#                   name: oauth-hmac
+#                   generic_secret:
+#                     secret: "your-hmac-secret"
+#               auth_scopes:
+#               - "openid"
+#               - "profile"
+#               - "email"
+#               resources:
+#               - oauth2_metadata:
+#                   token_endpoint: "http://keycloak.keycloak.svc.cluster.local:8080/realms/master/protocol/openid-connect/token"
+#                   authorization_endpoint: "http://localhost:30002/realms/master/protocol/openid-connect/auth"
+#                   callbacks:
+#                   - "http://localhost:30000/productpage"
+#                 clusters:
+#                 - "outbound|8080||keycloak.keycloak.svc.cluster.local"
+#             #   forward_bearer_token: true
+#             #   pass_through_matcher:
+#             #     - prefix: "/static"
+#             #     - prefix: "/api/v1/products"
+#   EOF
+#   depends_on = [
+#     helm_release.istio_ingress,
+#     helm_release.keycloak
+#   ]
+# }
+resource "kubectl_manifest" "bookinfo_envoyfilter" {
+  yaml_body = <<-EOF
+    apiVersion: networking.istio.io/v1alpha3
+    kind: EnvoyFilter
+    metadata:
+      name: authn-filter
+      namespace: istio-system
+    spec:
+      workloadSelector:
+        labels:
+          istio: ingressgateway
+      configPatches:
+      - applyTo: HTTP_FILTER
+        match:
+          context: GATEWAY
+          listener:
+            filterChain:
+              filter:
+                name: envoy.filters.network.http_connection_manager
+                subFilter:
+                  name: envoy.filters.http.router
+        patch:
+          operation: INSERT_BEFORE
+          value:
+            name: envoy.filters.http.oauth2
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2
+              token_endpoint: http://keycloak.keycloak.svc.cluster.local:8080/realms/master/protocol/openid-connect/token
+              authorization_endpoint: http://localhost:30002/realms/master/protocol/openid-connect/auth
+              redirect_uri: http://localhost:30000/productpage
+              redirect_path_matcher:
+                exact: /productpage
+              credentials:
+                client_id: bookinfo
+              auth_scopes:
+              - web-origins
+              - acr
+              - roles
+              - profile
+              - email
+              pass_through_matcher:
+              - prefix: /static
+              - regex: .*\\.css$
+              - regex: .*\\.js$
+              - regex: .*\\.png$
+              - regex: .*\\.jpg$
+              - regex: .*\\.gif$
+              forward_bearer_token: true
+  EOF
+  depends_on = [
+    helm_release.istio_ingress,
+    helm_release.keycloak
+  ]
 }
